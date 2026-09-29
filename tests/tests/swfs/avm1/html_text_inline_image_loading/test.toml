@@ -1,0 +1,15 @@
+num_ticks = 10
+
+
+[player_options]
+with_renderer = { optional = false }
+
+[[compilers]]
+type = "Rascal"
+target = "test.swf"
+scripts = ["test.as"]
+swf_version = 8
+
+[fonts.arial]
+family = "Arial"
+path = "NotoSans.ttf"

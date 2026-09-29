@@ -35,7 +35,7 @@ use chrono::Utc;
 use core::fmt;
 use gc_arena::barrier::unlock;
 use gc_arena::lock::{Lock, RefLock};
-use gc_arena::{Collect, Gc, Mutation};
+use gc_arena::{Collect, DynamicRoot, Gc, Mutation, Rootable};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_macros::istr;
 use ruffle_render::commands::Command as RenderCommand;
@@ -73,6 +73,19 @@ pub enum AutoSizeMode {
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
 pub struct EditText<'gc>(Gc<'gc, EditTextData<'gc>>);
+
+#[derive(Clone)]
+pub(crate) struct EditTextHandle(DynamicRoot<Rootable![EditTextData<'_>]>);
+
+impl EditTextHandle {
+    pub(crate) fn stash<'gc>(context: &UpdateContext<'gc>, this: EditText<'gc>) -> Self {
+        Self(context.dynamic_root.stash(context.gc(), this.0))
+    }
+
+    pub(crate) fn fetch<'gc>(&self, context: &UpdateContext<'gc>) -> EditText<'gc> {
+        EditText(context.dynamic_root.fetch(&self.0))
+    }
+}
 
 impl fmt::Debug for EditText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -119,6 +132,13 @@ pub struct EditTextData<'gc> {
 
     /// The calculated layout.
     layout: RefLock<Layout<'gc>>,
+
+    /// MovieClip containers used by HTML inline images.
+    inline_images: RefLock<Vec<Option<crate::display_object::MovieClip<'gc>>>>,
+
+    /// Incremented when inline-image state is replaced, preventing stale
+    /// asynchronous loads from updating a newer htmlText value.
+    inline_image_generation: Cell<u64>,
 
     /// Style sheet used when parsing HTML.
     style_sheet: Lock<EditTextStyleSheet<'gc>>,
@@ -333,6 +353,8 @@ impl<'gc> EditText<'gc> {
                 border_color: Cell::new(Color::BLACK),
                 object: Lock::new(None),
                 layout: RefLock::new(Default::default()),
+                inline_images: RefLock::new(Vec::new()),
+                inline_image_generation: Cell::new(0),
                 bounds: Cell::new(*swf_tag.bounds()),
                 autosize_lazy_bounds: Cell::new(None),
                 autosize: Cell::new(autosize),
@@ -474,6 +496,44 @@ impl<'gc> EditText<'gc> {
         }
     }
 
+    fn reset_inline_image_instances(self, context: &mut UpdateContext<'gc>) {
+        let image_count = self.0.text_spans.borrow().inline_images().count();
+        let mut instances =
+            unlock!(Gc::write(context.gc(), self.0), EditTextData, inline_images).borrow_mut();
+
+        // Keep one runtime image slot for each parsed HTML IMG, discarding
+        // instances that belonged to the previous htmlText value.
+        instances.clear();
+        instances.resize(image_count, None);
+    }
+
+    fn load_inline_images(self, context: &mut UpdateContext<'gc>) {
+        let images = self
+            .0
+            .text_spans
+            .borrow()
+            .inline_images()
+            .cloned()
+            .collect::<Vec<_>>();
+        let generation = self.inline_image_generation();
+
+        for (index, image) in images.iter().enumerate() {
+            if image.src.is_empty() {
+                continue;
+            }
+
+            let target = crate::loader::LoadManager::load_text_field_image(
+                context,
+                self,
+                index,
+                image.src.to_utf8_lossy().into_owned(),
+                generation,
+            );
+
+            self.set_inline_image_instance(context, index, target);
+        }
+    }
+
     pub fn set_html_text(self, text: &WStr, context: &mut UpdateContext<'gc>) {
         if self.html_text() == text {
             // Note: this check not only prevents text relayout,
@@ -486,10 +546,34 @@ impl<'gc> EditText<'gc> {
         }
 
         if self.is_effectively_html() {
+            self.0
+                .inline_image_generation
+                .set(self.0.inline_image_generation.get().wrapping_add(1));
+
             self.0.parse_html(text);
+            self.reset_inline_image_instances(context);
             self.relayout(context);
+            self.load_inline_images(context);
         } else {
             self.set_text(text, context);
+        }
+    }
+
+    pub(crate) fn inline_image_generation(self) -> u64 {
+        self.0.inline_image_generation.get()
+    }
+
+    pub(crate) fn set_inline_image_instance(
+        self,
+        context: &mut UpdateContext<'gc>,
+        index: usize,
+        image: crate::display_object::MovieClip<'gc>,
+    ) {
+        let mut images =
+            unlock!(Gc::write(context.gc(), self.0), EditTextData, inline_images).borrow_mut();
+
+        if let Some(slot) = images.get_mut(index) {
+            *slot = Some(image);
         }
     }
 
@@ -859,6 +943,47 @@ impl<'gc> EditText<'gc> {
 
         unlock!(Gc::write(activation.gc(), self.0), EditTextData, variable).set(variable);
         self.try_bind_text_field_variable(activation, true);
+    }
+
+    pub(crate) fn update_inline_image_dimensions(
+        self,
+        context: &mut UpdateContext<'gc>,
+        index: usize,
+    ) {
+        let image = self.0.inline_images.borrow().get(index).copied().flatten();
+
+        let Some(image) = image else {
+            return;
+        };
+
+        let bounds = image.bounds(BoundsMode::Script);
+        let width = bounds.width();
+        let height = bounds.height();
+
+        if width <= Twips::ZERO || height <= Twips::ZERO {
+            return;
+        }
+
+        let width = width.to_pixels();
+        let height = height.to_pixels();
+        let mut changed = false;
+
+        {
+            let mut text_spans = self.0.text_spans.borrow_mut();
+
+            if let Some(inline_image) = text_spans.inline_images_mut().nth(index)
+                && (inline_image.intrinsic_width != Some(width)
+                    || inline_image.intrinsic_height != Some(height))
+            {
+                inline_image.intrinsic_width = Some(width);
+                inline_image.intrinsic_height = Some(height);
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.relayout(context);
+        }
     }
 
     /// Relayout the `EditText`.
@@ -1317,6 +1442,51 @@ impl<'gc> EditText<'gc> {
                 let underline_y = ascent + (max_descent / 2);
                 let underline_width = lbox.bounds().width();
                 self.render_underline(context, underline_width, underline_y, params.color);
+            }
+        }
+
+        if let LayoutContent::InlineImage { index, .. } = lbox.content() {
+            let image = self.0.inline_images.borrow().get(*index).copied().flatten();
+
+            if let Some(image) = image {
+                let requested_size = self
+                    .0
+                    .text_spans
+                    .borrow()
+                    .inline_images()
+                    .nth(*index)
+                    .map(|inline_image| (inline_image.width, inline_image.height));
+
+                let should_scale = matches!(
+                    requested_size,
+                    Some((Some(width), Some(height))) if width != 0.0 && height != 0.0
+                );
+
+                if should_scale {
+                    let image_bounds = image.bounds(BoundsMode::Script);
+                    let image_width = image_bounds.width();
+                    let image_height = image_bounds.height();
+                    let target_width = lbox.bounds().width();
+                    let target_height = lbox.bounds().height();
+
+                    if image_width > Twips::ZERO && image_height > Twips::ZERO {
+                        let scale_x =
+                            target_width.to_pixels() as f32 / image_width.to_pixels() as f32;
+                        let scale_y =
+                            target_height.to_pixels() as f32 / image_height.to_pixels() as f32;
+
+                        context.transform_stack.push(&Transform {
+                            matrix: Matrix::scale(scale_x, scale_y),
+                            ..Default::default()
+                        });
+                        image.render(context);
+                        context.transform_stack.pop();
+                    } else {
+                        image.render(context);
+                    }
+                } else {
+                    image.render(context);
+                }
             }
         }
 
@@ -2255,7 +2425,7 @@ impl<'gc> EditText<'gc> {
                     first_format = Some(text_format);
                     break;
                 }
-                LayoutContent::Drawing { .. } => {}
+                LayoutContent::Drawing { .. } | LayoutContent::InlineImage { .. } => {}
             }
         }
 

@@ -27,8 +27,8 @@ use crate::bitmap::bitmap_data::BitmapData;
 use crate::bitmap::bitmap_data::Color;
 use crate::context::{ActionQueue, ActionType, UpdateContext};
 use crate::display_object::{
-    DisplayObject, MovieClip, MovieClipHandle, TDisplayObject, TDisplayObjectContainer,
-    TInteractiveObject,
+    DisplayObject, EditText, EditTextHandle, MovieClip, MovieClipHandle, TDisplayObject,
+    TDisplayObjectContainer, TInteractiveObject,
 };
 use crate::events::ClipEvent;
 use crate::limits::ExecutionLimit;
@@ -281,6 +281,116 @@ impl<'gc> LoadManager<'gc> {
             _ => unreachable!(),
         }
         false
+    }
+
+    pub fn load_text_field_image(
+        context: &mut UpdateContext<'gc>,
+        text_field: EditText<'gc>,
+        index: usize,
+        url: String,
+        generation: u64,
+    ) -> MovieClip<'gc> {
+        let player = context.player_handle();
+        let target = MovieClip::new(text_field.movie(), context.gc());
+        target.set_parent(context, Some(text_field.into()));
+
+        let request = Request::get(url);
+        let text_field_handle = EditTextHandle::stash(context, text_field);
+        let target_handle = MovieClipHandle::stash(context, target);
+        let completion_player = player;
+
+        let future = Box::pin(async move {
+            let fetch = completion_player
+                .lock()
+                .unwrap()
+                .fetch(request, FetchReason::LoadSwf);
+
+            let (body, resolved_url, _status, _redirected) =
+                match wait_for_full_response(fetch).await {
+                    Ok(response) => response,
+                    Err(response) => {
+                        tracing::error!(
+                            "Error during HTML TextField image loading of {:?}: {:?}",
+                            response.url,
+                            response.error
+                        );
+                        return Ok(());
+                    }
+                };
+
+            let content_type = ContentType::sniff(&body);
+
+            if !matches!(
+                content_type,
+                ContentType::Gif | ContentType::Jpeg | ContentType::JpegXr | ContentType::Png
+            ) {
+                tracing::warn!(
+                    "Unsupported HTML TextField image content type: {}",
+                    content_type
+                );
+                return Ok(());
+            }
+
+            completion_player
+                .lock()
+                .unwrap()
+                .update(|context| -> Result<(), Error> {
+                    let text_field = text_field_handle.fetch(context);
+
+                    if text_field.inline_image_generation() != generation {
+                        return Ok(());
+                    }
+
+                    let target = target_handle.fetch(context);
+                    let bitmap = ruffle_render::utils::decode_define_bits_jpeg(&body, None)?;
+                    let transparency = bitmap.format().supports_transparency();
+
+                    let bitmapdata = BitmapData::new_with_pixels(
+                        context.gc(),
+                        bitmap.width(),
+                        bitmap.height(),
+                        transparency,
+                        bitmap.as_colors().map(Color::from).collect(),
+                    );
+
+                    let mut activation = Avm2Activation::from_nothing(context);
+                    let bitmapdata_avm2 =
+                        BitmapDataObject::from_bitmap_data(activation.context, bitmapdata);
+
+                    let bitmap_avm2 = activation
+                        .avm2()
+                        .classes()
+                        .bitmap
+                        .construct(&mut activation, &[bitmapdata_avm2.into()])
+                        .unwrap()
+                        .as_object()
+                        .unwrap();
+
+                    let bitmap_dobj = bitmap_avm2.as_display_object().unwrap();
+                    let movie = Arc::new(SwfMovie::from_loaded_image(
+                        resolved_url,
+                        false,
+                        body.len(),
+                        bitmap.width(),
+                        bitmap.height(),
+                    ));
+
+                    target.replace_with_movie(activation.context, Some(movie), true, None);
+                    target.replace_at_depth(activation.context, bitmap_dobj, 1);
+                    target.set_current_frame(1);
+                    target.set_cur_preload_frame(2);
+
+                    text_field.update_inline_image_dimensions(context, index);
+
+                    Ok(())
+                })?;
+
+            Ok(())
+        });
+
+        context.navigator.spawn_future(future);
+
+        target
     }
 
     /// Kick off a movie clip load.

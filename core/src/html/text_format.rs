@@ -440,7 +440,7 @@ pub struct TextSpan {
     /// length of the underlying source string.
     pub span_length: usize,
 
-    image: Option<Box<TextSpanImage>>,
+    pub(crate) image: Option<Box<TextSpanImage>>,
 
     pub font: TextSpanFont,
     pub style: TextSpanStyle,
@@ -673,7 +673,7 @@ impl TextSpan {
 }
 
 #[derive(Clone, Debug)]
-struct TextSpanImage {
+pub(crate) struct TextSpanImage {
     pub src: WString,
     pub id: Option<WString>,
     pub width: Option<f64>,
@@ -682,6 +682,8 @@ struct TextSpanImage {
     pub hspace: Option<f64>,
     pub vspace: Option<f64>,
     pub check_policy_file: Option<bool>,
+    pub intrinsic_width: Option<f64>,
+    pub intrinsic_height: Option<f64>,
 }
 
 /// Struct which contains text formatted by `TextSpan`s.
@@ -1058,6 +1060,8 @@ impl FormatSpans {
                                     check_policy_file: image_attribute(b"checkpolicyfile").map(
                                         |value| value.to_utf8_lossy().eq_ignore_ascii_case("true"),
                                     ),
+                                    intrinsic_width: None,
+                                    intrinsic_height: None,
                                 };
 
                                 let mut image_format = format;
@@ -1253,6 +1257,16 @@ impl FormatSpans {
     /// Retrieve the text backing the format spans.
     pub fn text(&self) -> &WStr {
         &self.text
+    }
+
+    pub(crate) fn inline_images(&self) -> impl Iterator<Item = &TextSpanImage> {
+        self.spans.iter().filter_map(|span| span.image.as_deref())
+    }
+
+    pub(crate) fn inline_images_mut(&mut self) -> impl Iterator<Item = &mut TextSpanImage> {
+        self.spans
+            .iter_mut()
+            .filter_map(|span| span.image.as_deref_mut())
     }
 
     pub fn displayed_text(&self) -> &WStr {

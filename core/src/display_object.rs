@@ -52,6 +52,7 @@ pub use crate::display_object::container::{
 pub use avm1_button::{Avm1Button, ButtonState, ButtonTracking};
 pub use avm2_button::Avm2Button;
 pub use bitmap::{Bitmap, BitmapClass};
+pub(crate) use edit_text::EditTextHandle;
 #[allow(unused)]
 pub use edit_text::LayoutDebugBoxesFlag;
 pub use edit_text::{AutoSizeMode, EditText, TextSelection};
